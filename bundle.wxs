@@ -1,46 +1,55 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
      xmlns:netfx="http://wixtoolset.org/schemas/v4/wxs/netfx">
 
-  <Bundle
-      Name="John mTLS Setup"
+  <Package
+      Id="john.mtls"
+      Name="mtls"
       Manufacturer="john"
-      Version="0.0.1.0"
-      UpgradeCode="a3ac6b7c-29fa-4fe2-88fa-36430c8a0eb2">
+      Version="0.0.1">
 
-    <BootstrapperApplication>
-      <bal:WixStandardBootstrapperApplication
-          Theme="hyperlinkLicense"
-          LicenseUrl="" />
-    </BootstrapperApplication>
+    <File Source="publish\MtlsServer.exe" />
+    <File Source="publish\appsettings.Development.json" />
+    <File Source="publish\Microsoft.AspNetCore.Authentication.Certificate.dll" />
+    <File Source="publish\MtlsServer.pdb" />
+    <File Source="publish\MtlsServer.staticwebassets.endpoints.json" />
+    <File Source="publish\MtlsServer.dll" />
+    <File Source="publish\MtlsServer.deps.json" />
+    <File Source="publish\MtlsServer.runtimeconfig.json" />
+    <File Source="publish\appsettings.json" />
 
-    <!-- Sets this variable to the installed .NET 10 Desktop Runtime version.
-         If none is installed, the variable is empty/nonexistent. -->
-    <netfx:DotNetCoreSearch
-        Id="DotNet10DesktopX64Search"
-        RuntimeType="desktop"
-        Platform="x64"
-        MajorVersion="10"
-        Variable="DotNet10DesktopX64Version" />
+    <!--
+      Sets DOTNET10CHECK to:
+        0     = compatible runtime found
+        12289 = no runtime installed
+        12290 = required runtime missing
+        other = detection failure
+    -->
+    <netfx:DotNetCompatibilityCheck
+    Id="CheckDotNet10DesktopX64"
+    Property="DOTNET10CHECK"
+    Version="10.0.0"
+    RuntimeType="desktop"
+    Platform="x64"
+    RollForward="latestPatch" />
 
-    <Chain>
+<Binary
+    Id="DotNet10DesktopInstaller"
+    SourceFile="windowsdesktop-runtime-10.0.14-win-x64.exe" />
 
-      <ExePackage
-          Id="DotNet10DesktopRuntimeX64"
-          SourceFile="windowsdesktop-runtime-10.0.14-win-x64.exe"
-          InstallArguments="/install /quiet /norestart"
-          RepairArguments="/repair /quiet /norestart"
-          UninstallArguments="/uninstall /quiet /norestart"
-          DetectCondition="DotNet10DesktopX64Version"
-          Permanent="yes"
-          Vital="yes"
-          PerMachine="yes" />
+<CustomAction
+    Id="InstallDotNet10Desktop"
+    BinaryRef="DotNet10DesktopInstaller"
+    ExeCommand="/install /quiet /norestart"
+    Execute="immediate"
+    Return="check" />
 
-      <MsiPackage
-          Id="MtlsServer"
-          SourceFile="bin\Debug\quickstart.msi"
-          Vital="yes" />
+<InstallExecuteSequence>
+  <Custom
+      Action="InstallDotNet10Desktop"
+      After="InstallFinalize"
+      Condition="NOT Installed AND DOTNET10CHECK &lt;&gt; &quot;0&quot;" />
+</InstallExecuteSequence>
 
-    </Chain>
-  </Bundle>
+
+  </Package>
 </Wix>
