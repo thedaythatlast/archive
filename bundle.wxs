@@ -1,0 +1,46 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:netfx="http://wixtoolset.org/schemas/v4/wxs/netfx">
+
+  <Bundle
+      Name="John mTLS Setup"
+      Manufacturer="john"
+      Version="0.0.1.0"
+      UpgradeCode="a3ac6b7c-29fa-4fe2-88fa-36430c8a0eb2">
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+          Theme="hyperlinkLicense"
+          LicenseUrl="" />
+    </BootstrapperApplication>
+
+    <!-- Sets this variable to the installed .NET 10 Desktop Runtime version.
+         If none is installed, the variable is empty/nonexistent. -->
+    <netfx:DotNetCoreSearch
+        Id="DotNet10DesktopX64Search"
+        RuntimeType="desktop"
+        Platform="x64"
+        MajorVersion="10"
+        Variable="DotNet10DesktopX64Version" />
+
+    <Chain>
+
+      <ExePackage
+          Id="DotNet10DesktopRuntimeX64"
+          SourceFile="windowsdesktop-runtime-10.0.14-win-x64.exe"
+          InstallArguments="/install /quiet /norestart"
+          RepairArguments="/repair /quiet /norestart"
+          UninstallArguments="/uninstall /quiet /norestart"
+          DetectCondition="DotNet10DesktopX64Version"
+          Permanent="yes"
+          Vital="yes"
+          PerMachine="yes" />
+
+      <MsiPackage
+          Id="MtlsServer"
+          SourceFile="bin\Debug\quickstart.msi"
+          Vital="yes" />
+
+    </Chain>
+  </Bundle>
+</Wix>
