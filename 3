@@ -1,645 +1,383 @@
-main.cpp:
-#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <Windows.h>
+#include <winternl.h>
 
-#include <windows.h>
-#include <tlhelp32.h>
-#include <sstream>
-#include <cstdint>
-#include <cstring>
-#include <iomanip>
-#include <iostream>
-#include <limits>
-#include <string>
-#include <vector>
+#include <cstddef>
+#include <cstdio>
+#include <cwchar>
 
-#pragma comment(lib, "advapi32.lib")
+using NtQueryInformationProcess_t = NTSTATUS(NTAPI*)(
+    HANDLE,
+    PROCESSINFOCLASS,
+    PVOID,
+    ULONG,
+    PULONG
+);
 
-namespace
+static void PrintProtection(DWORD protection)
 {
-    // Use the numeric values deliberately so the probe can be compiled with
-    // SDKs where TokenIsLessPrivilegedAppContainer is not named in winnt.h.
-    constexpr TOKEN_INFORMATION_CLASS kTokenIsAppContainer =
-        static_cast<TOKEN_INFORMATION_CLASS>(29);
+    protection &= 0xFF;
 
-    constexpr TOKEN_INFORMATION_CLASS kClass46 =
-        static_cast<TOKEN_INFORMATION_CLASS>(46);
+    switch (protection) {
+    case PAGE_NOACCESS:
+        std::printf("PAGE_NOACCESS");
+        break;
+    case PAGE_READONLY:
+        std::printf("PAGE_READONLY");
+        break;
+    case PAGE_READWRITE:
+        std::printf("PAGE_READWRITE");
+        break;
+    case PAGE_WRITECOPY:
+        std::printf("PAGE_WRITECOPY");
+        break;
+    case PAGE_EXECUTE:
+        std::printf("PAGE_EXECUTE");
+        break;
+    case PAGE_EXECUTE_READ:
+        std::printf("PAGE_EXECUTE_READ");
+        break;
+    case PAGE_EXECUTE_READWRITE:
+        std::printf("PAGE_EXECUTE_READWRITE");
+        break;
+    case PAGE_EXECUTE_WRITECOPY:
+        std::printf("PAGE_EXECUTE_WRITECOPY");
+        break;
+    default:
+        std::printf("unknown protection 0x%08lX", protection);
+        break;
+    }
+}
 
-    constexpr DWORD kSentinelReturnLength = 0xCCCCCCCCu;
-    constexpr BYTE  kSentinelByte = 0xCC;
+static void DescribeAddress(const char* name, void* address)
+{
+    MEMORY_BASIC_INFORMATION mbi{};
 
-    struct ScopedHandle
-    {
-        HANDLE value = nullptr;
+    SIZE_T result = VirtualQuery(
+        address,
+        &mbi,
+        sizeof(mbi));
 
-        ScopedHandle() = default;
-        explicit ScopedHandle(HANDLE h) : value(h) {}
+    if (result == 0) {
+        std::printf(
+            "%s: VirtualQuery failed: %lu\n",
+            name,
+            GetLastError());
 
-        ScopedHandle(const ScopedHandle&) = delete;
-        ScopedHandle& operator=(const ScopedHandle&) = delete;
+        return;
+    }
 
-        ScopedHandle(ScopedHandle&& other) noexcept : value(other.value)
-        {
-            other.value = nullptr;
-        }
+    std::printf(
+        "%s=%p  allocationBase=%p  state=0x%08lX  type=0x%08lX  protection=",
+        name,
+        address,
+        mbi.AllocationBase,
+        mbi.State,
+        mbi.Type);
 
-        ScopedHandle& operator=(ScopedHandle&& other) noexcept
-        {
-            if (this != &other)
-            {
-                reset();
-                value = other.value;
-                other.value = nullptr;
-            }
-            return *this;
-        }
+    PrintProtection(mbi.Protect);
+    std::printf("\n");
+}
 
-        ~ScopedHandle()
-        {
-            reset();
-        }
+static bool ReadExact(
+    HANDLE process,
+    const void* address,
+    void* destination,
+    SIZE_T size)
+{
+    SIZE_T bytesRead = 0;
 
-        void reset(HANDLE h = nullptr)
-        {
-            if (value != nullptr && value != INVALID_HANDLE_VALUE)
-            {
-                CloseHandle(value);
-            }
-            value = h;
-        }
+    BOOL ok = ReadProcessMemory(
+        process,
+        address,
+        destination,
+        size,
+        &bytesRead);
 
-        HANDLE get() const
-        {
-            return value;
-        }
+    if (!ok || bytesRead != size) {
+        std::printf(
+            "ReadProcessMemory(%p) failed: ok=%d read=%zu error=%lu\n",
+            address,
+            ok,
+            bytesRead,
+            GetLastError());
 
-        HANDLE release()
-        {
-            HANDLE h = value;
-            value = nullptr;
-            return h;
-        }
+        return false;
+    }
 
-        explicit operator bool() const
-        {
-            return value != nullptr && value != INVALID_HANDLE_VALUE;
-        }
-    };
+    return true;
+}
 
-    struct CallResult
-    {
-        BOOL success = FALSE;
-        DWORD returnLength = kSentinelReturnLength;
-        DWORD lastError = ERROR_SUCCESS;
-        std::vector<BYTE> bytes;
-    };
+template<typename T>
+static bool ReadValue(
+    HANDLE process,
+    const void* address,
+    T& value)
+{
+    return ReadExact(
+        process,
+        address,
+        &value,
+        sizeof(value));
+}
 
-    struct TokenProbeResult
-    {
-        std::string tokenName;
-        DWORD processId = 0;
+static bool ReadRemoteString(
+    HANDLE process,
+    const UNICODE_STRING& string,
+    wchar_t* buffer,
+    SIZE_T bufferCount)
+{
+    if (bufferCount == 0)
+        return false;
 
-        bool appContainerQuerySucceeded = false;
-        DWORD isAppContainer = 0;
-        DWORD appContainerError = ERROR_SUCCESS;
+    SIZE_T characters = string.Length / sizeof(wchar_t);
 
-        CallResult sizingCall;
-        CallResult class46Call;
-    };
+    if (characters >= bufferCount)
+        characters = bufferCount - 1;
 
-    std::string ErrorName(DWORD error)
-    {
-        switch (error)
-        {
-        case ERROR_SUCCESS:
-            return "ERROR_SUCCESS";
-        case ERROR_ACCESS_DENIED:
-            return "ERROR_ACCESS_DENIED";
-        case ERROR_INSUFFICIENT_BUFFER:
-            return "ERROR_INSUFFICIENT_BUFFER";
-        case ERROR_INVALID_PARAMETER:
-            return "ERROR_INVALID_PARAMETER";
-        case ERROR_INVALID_HANDLE:
-            return "ERROR_INVALID_HANDLE";
-        case ERROR_BAD_LENGTH:
-            return "ERROR_BAD_LENGTH";
-        case ERROR_NO_TOKEN:
-            return "ERROR_NO_TOKEN";
-        default:
-            return "";
+    if (characters != 0) {
+        if (!ReadExact(
+                process,
+                string.Buffer,
+                buffer,
+                characters * sizeof(wchar_t))) {
+            return false;
         }
     }
 
-    std::string FormatError(DWORD error)
-    {
-        const std::string name = ErrorName(error);
-        if (!name.empty())
-        {
-            return std::to_string(error) + " (" + name + ")";
-        }
+    buffer[characters] = L'\0';
+    return true;
+}
 
-        return std::to_string(error);
+static void TestSameValueWrite(
+    HANDLE process,
+    const char* description,
+    void* destination)
+{
+    void* currentValue = nullptr;
+
+    if (!ReadValue(process, destination, currentValue)) {
+        std::printf(
+            "%-38s could not read destination\n",
+            description);
+
+        return;
     }
 
-    std::string BytesToHex(const std::vector<BYTE>& bytes)
-    {
-        if (bytes.empty())
-        {
-            return "<none>";
-        }
+    SIZE_T bytesWritten = 0;
+    SetLastError(ERROR_SUCCESS);
 
-        std::ostringstream stream;
-        stream << std::hex << std::uppercase << std::setfill('0');
+    BOOL ok = WriteProcessMemory(
+        process,
+        destination,
+        &currentValue,
+        sizeof(currentValue),
+        &bytesWritten);
 
-        for (std::size_t i = 0; i < bytes.size(); ++i)
-        {
-            if (i != 0)
-            {
-                stream << ' ';
-            }
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
 
-            stream << std::setw(2)
-                   << static_cast<unsigned int>(bytes[i]);
-        }
+    std::printf(
+        "%-38s address=%p value=%p ok=%d written=%zu error=%lu\n",
+        description,
+        destination,
+        currentValue,
+        ok,
+        bytesWritten,
+        error);
+}
 
-        return stream.str();
+static bool TestKernelBaseListLinks(HANDLE process)
+{
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+
+    auto NtQueryInformationProcess =
+        reinterpret_cast<NtQueryInformationProcess_t>(
+            GetProcAddress(
+                ntdll,
+                "NtQueryInformationProcess"));
+
+    if (!NtQueryInformationProcess) {
+        std::printf("Could not resolve NtQueryInformationProcess\n");
+        return false;
     }
 
-    std::string DecodeReturnedValue(const CallResult& result)
-    {
-        if (!result.success)
-        {
-            return "<invalid because call failed>";
-        }
+    PROCESS_BASIC_INFORMATION pbi{};
 
-        if (result.bytes.empty())
-        {
-            return "<no returned bytes>";
-        }
+    NTSTATUS status = NtQueryInformationProcess(
+        process,
+        ProcessBasicInformation,
+        &pbi,
+        sizeof(pbi),
+        nullptr);
 
-        if (result.bytes.size() >= sizeof(DWORD))
-        {
-            DWORD value = 0;
-            std::memcpy(&value, result.bytes.data(), sizeof(value));
-            return std::to_string(value);
-        }
+    if (status < 0) {
+        std::printf(
+            "NtQueryInformationProcess failed: 0x%08lX\n",
+            static_cast<unsigned long>(status));
 
-        return "<fewer than sizeof(DWORD) bytes>";
+        return false;
     }
 
-    bool QueryIsAppContainer(
-        HANDLE token,
-        DWORD& isAppContainer,
-        DWORD& error)
-    {
-        isAppContainer = 0xCCCCCCCCu;
-        DWORD returnLength = kSentinelReturnLength;
+    PEB peb{};
 
-        SetLastError(ERROR_SUCCESS);
+    if (!ReadValue(process, pbi.PebBaseAddress, peb))
+        return false;
 
-        const BOOL ok = GetTokenInformation(
-            token,
-            kTokenIsAppContainer,
-            &isAppContainer,
-            static_cast<DWORD>(sizeof(isAppContainer)),
-            &returnLength);
+    PEB_LDR_DATA ldr{};
 
-        error = ok ? ERROR_SUCCESS : GetLastError();
-        return ok != FALSE;
-    }
+    if (!ReadValue(process, peb.Ldr, ldr))
+        return false;
 
-    CallResult MakeSizingCall(HANDLE token)
-    {
-        CallResult result;
-        result.returnLength = kSentinelReturnLength;
+    auto listHead = reinterpret_cast<LIST_ENTRY*>(
+        reinterpret_cast<BYTE*>(peb.Ldr) +
+        offsetof(PEB_LDR_DATA, InMemoryOrderModuleList));
 
-        SetLastError(ERROR_SUCCESS);
+    LIST_ENTRY current{};
 
-        result.success = GetTokenInformation(
-            token,
-            kClass46,
-            nullptr,
-            0,
-            &result.returnLength);
+    if (!ReadValue(process, listHead, current))
+        return false;
 
-        result.lastError =
-            result.success ? ERROR_SUCCESS : GetLastError();
+    for (LIST_ENTRY* link = current.Flink;
+         link != listHead;
+         link = current.Flink) {
 
-        return result;
-    }
+        auto entryAddress =
+            CONTAINING_RECORD(
+                link,
+                LDR_DATA_TABLE_ENTRY,
+                InMemoryOrderLinks);
 
-    CallResult MakeRetrievalCall(
-        HANDLE token,
-        const CallResult& sizingResult)
-    {
-        CallResult result;
+        LDR_DATA_TABLE_ENTRY entry{};
+
+        if (!ReadValue(process, entryAddress, entry))
+            return false;
+
+        wchar_t moduleName[260]{};
+
+        if (!ReadRemoteString(
+                process,
+                entry.FullDllName,
+                moduleName,
+                _countof(moduleName))) {
+            return false;
+        }
+
+        if (!ReadValue(process, link, current))
+            return false;
+
+        if (_wcsicmp(moduleName, L"kernelbase.dll") != 0 &&
+            _wcsicmp(
+                wcsrchr(moduleName, L'\\')
+                    ? wcsrchr(moduleName, L'\\') + 1
+                    : moduleName,
+                L"kernelbase.dll") != 0) {
+            continue;
+        }
+
+        std::wprintf(
+            L"\nFound: %ls\n",
+            moduleName);
 
         /*
-         * If the sizing call supplied a plausible nonzero length, use it.
-         * Otherwise still make a direct sizeof(DWORD) query.
-         *
-         * The direct fallback is important here: if class 46 rejects the
-         * null-buffer sizing form but accepts a fixed DWORD-sized buffer,
-         * the probe will expose that distinction instead of incorrectly
-         * concluding that class 46 is wholly unsupported.
-         */
-        DWORD bufferLength = sizeof(DWORD);
+            HideDll performs:
 
-        if (sizingResult.returnLength != 0 &&
-            sizingResult.returnLength != kSentinelReturnLength &&
-            sizingResult.returnLength <= 1024 * 1024)
-        {
-            bufferLength = sizingResult.returnLength;
-        }
+              current.Blink->Flink = current.Flink
+              current.Flink->Blink = current.Blink
 
-        result.bytes.assign(bufferLength, kSentinelByte);
-        result.returnLength = kSentinelReturnLength;
+            Those destinations are represented below. However, this repro
+            writes the existing value back to each destination instead of
+            unlinking kernelbase.dll.
+        */
 
-        SetLastError(ERROR_SUCCESS);
+        void* previousFlinkAddress =
+            &current.Blink->Flink;
 
-        result.success = GetTokenInformation(
-            token,
-            kClass46,
-            result.bytes.data(),
-            bufferLength,
-            &result.returnLength);
+        void* nextBlinkAddress =
+            &current.Flink->Blink;
 
-        result.lastError =
-            result.success ? ERROR_SUCCESS : GetLastError();
+        DescribeAddress(
+            "previous entry's Flink",
+            previousFlinkAddress);
 
-        /*
-         * Keep the entire supplied buffer, including untouched 0xCC bytes.
-         * This makes partial writes or an unexpected ReturnLength visible.
-         */
-        return result;
+        DescribeAddress(
+            "next entry's Blink",
+            nextBlinkAddress);
+
+        TestSameValueWrite(
+            process,
+            "previous entry's Flink",
+            previousFlinkAddress);
+
+        TestSameValueWrite(
+            process,
+            "next entry's Blink",
+            nextBlinkAddress);
+
+        return true;
     }
 
-    TokenProbeResult ProbeToken(
-        const std::string& tokenName,
-        DWORD processId,
-        HANDLE token)
-    {
-        TokenProbeResult result;
-        result.tokenName = tokenName;
-        result.processId = processId;
+    std::printf("kernelbase.dll was not found\n");
+    return false;
+}
 
-        result.appContainerQuerySucceeded = QueryIsAppContainer(
-            token,
-            result.isAppContainer,
-            result.appContainerError);
+static void RunTest(DWORD access, const char* description)
+{
+    std::printf("\n=== %s ===\n", description);
+    std::printf("Requested access mask: 0x%08lX\n", access);
 
-        result.sizingCall = MakeSizingCall(token);
-        result.class46Call = MakeRetrievalCall(
-            token,
-            result.sizingCall);
+    HANDLE process = OpenProcess(
+        access,
+        FALSE,
+        GetCurrentProcessId());
 
-        return result;
+    if (!process) {
+        std::printf(
+            "OpenProcess failed: %lu\n",
+            GetLastError());
+
+        return;
     }
 
-    ScopedHandle FindAccessibleAppContainerToken(
-        DWORD& processId,
-        std::wstring& executableName,
-        DWORD& processesExamined,
-        DWORD& processOpenFailures,
-        DWORD& tokenOpenFailures)
-    {
-        processId = 0;
-        executableName.clear();
-        processesExamined = 0;
-        processOpenFailures = 0;
-        tokenOpenFailures = 0;
-
-        ScopedHandle snapshot(CreateToolhelp32Snapshot(
-            TH32CS_SNAPPROCESS,
-            0));
-
-        if (!snapshot)
-        {
-            return {};
-        }
-
-        PROCESSENTRY32W entry{};
-        entry.dwSize = sizeof(entry);
-
-        if (!Process32FirstW(snapshot.get(), &entry))
-        {
-            return {};
-        }
-
-        do
-        {
-            ++processesExamined;
-
-            if (entry.th32ProcessID == 0 ||
-                entry.th32ProcessID == GetCurrentProcessId())
-            {
-                continue;
-            }
-
-            ScopedHandle process(OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION,
-                FALSE,
-                entry.th32ProcessID));
-
-            if (!process)
-            {
-                ++processOpenFailures;
-                continue;
-            }
-
-            HANDLE rawToken = nullptr;
-
-            if (!OpenProcessToken(
-                    process.get(),
-                    TOKEN_QUERY,
-                    &rawToken))
-            {
-                ++tokenOpenFailures;
-                continue;
-            }
-
-            ScopedHandle token(rawToken);
-
-            DWORD isAppContainer = 0;
-            DWORD queryError = ERROR_SUCCESS;
-
-            if (!QueryIsAppContainer(
-                    token.get(),
-                    isAppContainer,
-                    queryError))
-            {
-                continue;
-            }
-
-            if (isAppContainer != 0)
-            {
-                processId = entry.th32ProcessID;
-                executableName = entry.szExeFile;
-                return token;
-            }
-        }
-        while (Process32NextW(snapshot.get(), &entry));
-
-        return {};
-    }
-
-    void PrintDetailedCall(
-        const char* label,
-        const CallResult& result)
-    {
-        std::cout
-            << "  " << label << '\n'
-            << "    BOOL return       : "
-            << static_cast<int>(result.success) << '\n'
-            << "    ReturnLength      : "
-            << result.returnLength
-            << " (0x" << std::hex << std::uppercase
-            << result.returnLength << std::dec << ")\n"
-            << "    GetLastError      : "
-            << FormatError(result.lastError) << '\n';
-
-        if (!result.bytes.empty())
-        {
-            std::cout
-                << "    supplied buffer   : "
-                << result.bytes.size() << " bytes\n"
-                << "    raw buffer bytes  : "
-                << BytesToHex(result.bytes) << '\n'
-                << "    DWORD interpretation: "
-                << DecodeReturnedValue(result) << '\n';
-        }
-    }
-
-    void PrintDetails(const TokenProbeResult& result)
-    {
-        std::cout << "\n=== " << result.tokenName << " ===\n";
-
-        if (result.processId != 0)
-        {
-            std::cout << "Process ID           : "
-                      << result.processId << '\n';
-        }
-
-        std::cout << "TokenIsAppContainer  : ";
-
-        if (result.appContainerQuerySucceeded)
-        {
-            std::cout << result.isAppContainer << '\n';
-        }
-        else
-        {
-            std::cout
-                << "<query failed>, GetLastError="
-                << FormatError(result.appContainerError)
-                << '\n';
-        }
-
-        PrintDetailedCall(
-            "Class 46 sizing call: buffer=NULL, length=0",
-            result.sizingCall);
-
-        PrintDetailedCall(
-            "Class 46 retrieval call",
-            result.class46Call);
-    }
-
-    void PrintSummaryHeader()
-    {
-        std::cout
-            << "\nSUMMARY\n"
-            << std::left
-            << std::setw(28) << "Token"
-            << std::setw(17) << "IsAppContainer"
-            << std::setw(19) << "class 46 success"
-            << std::setw(15) << "ReturnLength"
-            << std::setw(34) << "returned value/raw bytes"
-            << "GetLastError\n";
-
-        std::cout << std::string(130, '-') << '\n';
-    }
-
-    void PrintSummaryRow(const TokenProbeResult& result)
-    {
-        std::string appContainerText;
-
-        if (result.appContainerQuerySucceeded)
-        {
-            appContainerText = std::to_string(
-                result.isAppContainer);
-        }
-        else
-        {
-            appContainerText =
-                "failed:" +
-                std::to_string(result.appContainerError);
-        }
-
-        std::string valueAndBytes;
-
-        if (result.class46Call.success)
-        {
-            valueAndBytes =
-                DecodeReturnedValue(result.class46Call) +
-                " / " +
-                BytesToHex(result.class46Call.bytes);
-        }
-        else
-        {
-            valueAndBytes =
-                "<invalid> / " +
-                BytesToHex(result.class46Call.bytes);
-        }
-
-        std::cout
-            << std::left
-            << std::setw(28) << result.tokenName
-            << std::setw(17) << appContainerText
-            << std::setw(19)
-            << (result.class46Call.success ? "TRUE (1)" : "FALSE (0)")
-            << std::setw(15) << result.class46Call.returnLength
-            << std::setw(34) << valueAndBytes
-            << FormatError(result.class46Call.lastError)
-            << '\n';
-    }
+    TestKernelBaseListLinks(process);
+    CloseHandle(process);
 }
 
 int main()
 {
-    std::cout
-        << "GetTokenInformation class 46 probe\n"
-        << "PID: " << GetCurrentProcessId() << "\n"
-        << "Class 46 is passed numerically as "
-        << static_cast<int>(kClass46) << ".\n";
+    constexpr DWORD hideDllAccess =
+        PROCESS_VM_READ |
+        PROCESS_VM_WRITE |
+        PROCESS_QUERY_LIMITED_INFORMATION;
 
-    std::vector<TokenProbeResult> results;
+    RunTest(
+        hideDllAccess,
+        "HideDll access, without PROCESS_VM_OPERATION");
 
-    HANDLE rawCurrentToken = nullptr;
-
-    if (!OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_QUERY,
-            &rawCurrentToken))
-    {
-        const DWORD error = GetLastError();
-
-        std::cerr
-            << "OpenProcessToken(current process) failed: "
-            << FormatError(error) << '\n';
-
-        return 1;
-    }
-
-    ScopedHandle currentToken(rawCurrentToken);
-
-    results.push_back(ProbeToken(
-        "Current process",
-        GetCurrentProcessId(),
-        currentToken.get()));
-
-    DWORD appContainerPid = 0;
-    std::wstring appContainerExe;
-    DWORD processesExamined = 0;
-    DWORD processOpenFailures = 0;
-    DWORD tokenOpenFailures = 0;
-
-    ScopedHandle appContainerToken =
-        FindAccessibleAppContainerToken(
-            appContainerPid,
-            appContainerExe,
-            processesExamined,
-            processOpenFailures,
-            tokenOpenFailures);
-
-    if (appContainerToken)
-    {
-        std::string tokenName = "Existing AppContainer";
-
-        results.push_back(ProbeToken(
-            tokenName,
-            appContainerPid,
-            appContainerToken.get()));
-
-        std::wcout
-            << L"\nFound an accessible AppContainer process:"
-            << L"\n  executable: " << appContainerExe
-            << L"\n  PID       : " << appContainerPid
-            << L'\n';
-    }
-    else
-    {
-        std::cout
-            << "\nNo accessible AppContainer token was found by the "
-               "lightweight process scan.\n"
-            << "No AppContainer profile or elaborate launcher was created.\n"
-            << "Processes examined    : " << processesExamined << '\n'
-            << "Process-open failures : " << processOpenFailures << '\n'
-            << "Token-open failures   : " << tokenOpenFailures << '\n';
-    }
-
-    for (const TokenProbeResult& result : results)
-    {
-        PrintDetails(result);
-    }
-
-    PrintSummaryHeader();
-
-    for (const TokenProbeResult& result : results)
-    {
-        PrintSummaryRow(result);
-    }
+    RunTest(
+        hideDllAccess | PROCESS_VM_OPERATION,
+        "Same access, with PROCESS_VM_OPERATION");
 
     return 0;
 }
 
-cmakelists.txt:
-cmake_minimum_required(VERSION 3.20)
-project(token_class46_probe LANGUAGES CXX)
-add_executable(token_class46_probe main.cpp)
-target_compile_features(token_class46_probe PRIVATE cxx_std_17)
-target_link_libraries(token_class46_probe PRIVATE advapi32)
 
-PS C:\Users\nguyen\reproAC\build\Debug> ."C:/Users/nguyen/reproAC/build/Debug/token_class46_probe.exe"
-GetTokenInformation class 46 probe
-PID: 10584
-Class 46 is passed numerically as 46.
+PS C:\Users\nguyen\repro2\build\Debug> ./repro
 
-Found an accessible AppContainer process:
-  executable: fontdrvhost.exe
-  PID       : 576
+=== HideDll access, without PROCESS_VM_OPERATION ===
+Requested access mask: 0x00001030
 
-=== Current process ===
-Process ID           : 10584
-TokenIsAppContainer  : 0
-  Class 46 sizing call: buffer=NULL, length=0
-    BOOL return       : 0
-    ReturnLength      : 3435973836 (0xCCCCCCCC)
-    GetLastError      : 87 (ERROR_INVALID_PARAMETER)
-  Class 46 retrieval call
-    BOOL return       : 0
-    ReturnLength      : 3435973836 (0xCCCCCCCC)
-    GetLastError      : 87 (ERROR_INVALID_PARAMETER)
-    supplied buffer   : 4 bytes
-    raw buffer bytes  : CC CC CC CC
-    DWORD interpretation: <invalid because call failed>
+Found: C:\Windows\System32\KERNELBASE.dll
+previous entry's Flink=00000235591490A0  allocationBase=0000023559140000  state=0x00001000  type=0x00020000  protection=PAGE_READWRITE
+next entry's Blink=000002355914B8C8  allocationBase=0000023559140000  state=0x00001000  type=0x00020000  protection=PAGE_READWRITE
+previous entry's Flink                 address=00000235591490A0 value=0000023559149750 ok=1 written=8 error=0
+next entry's Blink                     address=000002355914B8C8 value=0000023559149750 ok=1 written=8 error=0
 
-=== Existing AppContainer ===
-Process ID           : 576
-TokenIsAppContainer  : 1
-  Class 46 sizing call: buffer=NULL, length=0
-    BOOL return       : 0
-    ReturnLength      : 3435973836 (0xCCCCCCCC)
-    GetLastError      : 87 (ERROR_INVALID_PARAMETER)
-  Class 46 retrieval call
-    BOOL return       : 0
-    ReturnLength      : 3435973836 (0xCCCCCCCC)
-    GetLastError      : 87 (ERROR_INVALID_PARAMETER)
-    supplied buffer   : 4 bytes
-    raw buffer bytes  : CC CC CC CC
-    DWORD interpretation: <invalid because call failed>
+=== Same access, with PROCESS_VM_OPERATION ===
+Requested access mask: 0x00001038
 
-SUMMARY
-Token                       IsAppContainer   class 46 success   ReturnLength   returned value/raw bytes          GetLastError
-----------------------------------------------------------------------------------------------------------------------------------
-Current process             0                FALSE (0)          3435973836     <invalid> / CC CC CC CC           87 (ERROR_INVALID_PARAMETER)
-Existing AppContainer       1                FALSE (0)          3435973836     <invalid> / CC CC CC CC           87 (ERROR_INVALID_PARAMETER)
-PS C:\Users\nguyen\reproAC\build\Debug> 
+Found: C:\Windows\System32\KERNELBASE.dll
+previous entry's Flink=00000235591490A0  allocationBase=0000023559140000  state=0x00001000  type=0x00020000  protection=PAGE_READWRITE
+next entry's Blink=000002355914B8C8  allocationBase=0000023559140000  state=0x00001000  type=0x00020000  protection=PAGE_READWRITE
+previous entry's Flink                 address=00000235591490A0 value=0000023559149750 ok=1 written=8 error=0
+next entry's Blink                     address=000002355914B8C8 value=0000023559149750 ok=1 written=8 error=0
+PS C:\Users\nguyen\repro2\build\Debug>
