@@ -1,605 +1,231 @@
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <authz.h>
-#include <sddl.h>
+#include <Windows.h>
 
-#include <iomanip>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <cwchar>
 #include <iostream>
-#include <string>
-#include <vector>
 
-#pragma comment(lib, "Authz.lib")
-#pragma comment(lib, "Advapi32.lib")
-
-namespace
+static int RunTarget()
 {
-    // Structurally valid synthetic AppContainer/package SIDs.
-    constexpr wchar_t kPackageSid1[] =
-        L"S-1-15-2-100-101-102-103-104-105-106-107";
+    constexpr SIZE_T BufferSize = 4096;
 
-    constexpr wchar_t kPackageSid2[] =
-        L"S-1-15-2-200-201-202-203-204-205-206-207";
-
-    // Well-known internetClient capability SID.
-    constexpr wchar_t kCapabilitySid[] =
-        L"S-1-15-3-1";
-
-    // An ordinary synthetic user SID used to create the initial Authz
-    // context. Package and capability information is then applied using
-    // AuthzSetAppContainerInformation.
-    constexpr wchar_t kBaseUserSid[] =
-        L"S-1-5-21-1-2-3-1000";
-
-    constexpr ACCESS_MASK kTestAccess = 0x00000001;
-
-    [[noreturn]] void Fail(const wchar_t* operation, DWORD error)
-    {
-        std::wcerr
-            << L"FATAL: " << operation
-            << L" failed; error=" << error
-            << L" (0x"
-            << std::hex << std::uppercase << error
-            << std::nouppercase << std::dec
-            << L")\n";
-
-        ExitProcess(error == ERROR_SUCCESS ? 1 : error);
-    }
-
-    class LocalMemory
-    {
-    public:
-        LocalMemory() = default;
-
-        explicit LocalMemory(void* pointer)
-            : pointer_(pointer)
-        {
-        }
-
-        ~LocalMemory()
-        {
-            if (pointer_ != nullptr)
-            {
-                LocalFree(pointer_);
-            }
-        }
-
-        LocalMemory(const LocalMemory&) = delete;
-        LocalMemory& operator=(const LocalMemory&) = delete;
-
-        LocalMemory(LocalMemory&& other) noexcept
-            : pointer_(other.pointer_)
-        {
-            other.pointer_ = nullptr;
-        }
-
-        LocalMemory& operator=(LocalMemory&& other) noexcept
-        {
-            if (this != &other)
-            {
-                if (pointer_ != nullptr)
-                {
-                    LocalFree(pointer_);
-                }
-
-                pointer_ = other.pointer_;
-                other.pointer_ = nullptr;
-            }
-
-            return *this;
-        }
-
-        void* get() const
-        {
-            return pointer_;
-        }
-
-    private:
-        void* pointer_ = nullptr;
-    };
-
-    class AuthzResourceManager
-    {
-    public:
-        AuthzResourceManager()
-        {
-            if (!AuthzInitializeResourceManager(
-                    AUTHZ_RM_FLAG_NO_AUDIT,
-                    nullptr,
-                    nullptr,
-                    nullptr,
-                    L"PackageCapabilityAppContainerRepro",
-                    &handle_))
-            {
-                Fail(
-                    L"AuthzInitializeResourceManager",
-                    GetLastError());
-            }
-        }
-
-        ~AuthzResourceManager()
-        {
-            if (handle_ != nullptr)
-            {
-                AuthzFreeResourceManager(handle_);
-            }
-        }
-
-        AuthzResourceManager(const AuthzResourceManager&) = delete;
-        AuthzResourceManager& operator=(
-            const AuthzResourceManager&) = delete;
-
-        AUTHZ_RESOURCE_MANAGER_HANDLE get() const
-        {
-            return handle_;
-        }
-
-    private:
-        AUTHZ_RESOURCE_MANAGER_HANDLE handle_ = nullptr;
-    };
-
-    class AuthzContext
-    {
-    public:
-        AuthzContext() = default;
-
-        explicit AuthzContext(AUTHZ_CLIENT_CONTEXT_HANDLE handle)
-            : handle_(handle)
-        {
-        }
-
-        ~AuthzContext()
-        {
-            if (handle_ != nullptr)
-            {
-                AuthzFreeContext(handle_);
-            }
-        }
-
-        AuthzContext(const AuthzContext&) = delete;
-        AuthzContext& operator=(const AuthzContext&) = delete;
-
-        AuthzContext(AuthzContext&& other) noexcept
-            : handle_(other.handle_)
-        {
-            other.handle_ = nullptr;
-        }
-
-        AuthzContext& operator=(AuthzContext&& other) noexcept
-        {
-            if (this != &other)
-            {
-                if (handle_ != nullptr)
-                {
-                    AuthzFreeContext(handle_);
-                }
-
-                handle_ = other.handle_;
-                other.handle_ = nullptr;
-            }
-
-            return *this;
-        }
-
-        AUTHZ_CLIENT_CONTEXT_HANDLE get() const
-        {
-            return handle_;
-        }
-
-    private:
-        AUTHZ_CLIENT_CONTEXT_HANDLE handle_ = nullptr;
-    };
-
-    LocalMemory SidFromString(const wchar_t* stringSid)
-    {
-        PSID sid = nullptr;
-
-        if (!ConvertStringSidToSidW(stringSid, &sid))
-        {
-            Fail(
-                L"ConvertStringSidToSidW",
-                GetLastError());
-        }
-
-        if (!IsValidSid(sid))
-        {
-            LocalFree(sid);
-            Fail(
-                L"IsValidSid",
-                ERROR_INVALID_SID);
-        }
-
-        return LocalMemory(sid);
-    }
-
-    LocalMemory SecurityDescriptorForSid(
-    const wchar_t* testedSid)
-{
-    // Both descriptors grant the requested access to the ordinary
-    // base-user side. The second ACE is the experimental variable:
-    //
-    //   package descriptor:
-    //       base user + package SID 1
-    //
-    //   capability descriptor:
-    //       base user + capability SID
-    //
-    // Owner, group, DACL flags, masks, and ACE types remain identical.
-    const std::wstring sddl =
-        std::wstring(L"O:SYG:SYD:P") +
-        L"(A;;0x1;;;" + kBaseUserSid + L")" +
-        L"(A;;0x1;;;" + testedSid + L")";
-
-    PSECURITY_DESCRIPTOR securityDescriptor = nullptr;
-
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.c_str(),
-            SDDL_REVISION_1,
-            &securityDescriptor,
-            nullptr))
-    {
-        Fail(
-            L"ConvertStringSecurityDescriptor"
-            L"ToSecurityDescriptorW",
-            GetLastError());
-    }
-
-    if (!IsValidSecurityDescriptor(securityDescriptor))
-    {
-        LocalFree(securityDescriptor);
-
-        Fail(
-            L"IsValidSecurityDescriptor",
-            ERROR_INVALID_SECURITY_DESCR);
-    }
-
-    return LocalMemory(securityDescriptor);
-}
-
-    AuthzContext MakeAppContainerContext(
-        AUTHZ_RESOURCE_MANAGER_HANDLE resourceManager,
-        PSID baseUserSid,
-        PSID packageSid,
-        PSID capabilitySid,
-        bool includeCapability)
-    {
-        AUTHZ_CLIENT_CONTEXT_HANDLE context = nullptr;
-        LUID identifier{};
-
-        // Create a controlled base context without account/group expansion.
-        if (!AuthzInitializeContextFromSid(
-                AUTHZ_SKIP_TOKEN_GROUPS,
-                baseUserSid,
-                resourceManager,
-                nullptr,
-                identifier,
-                nullptr,
-                &context))
-        {
-            Fail(
-                L"AuthzInitializeContextFromSid",
-                GetLastError());
-        }
-
-        AuthzContext ownedContext(context);
-
-        SID_AND_ATTRIBUTES capability{};
-
-        DWORD capabilityCount = 0;
-        PSID_AND_ATTRIBUTES capabilityArray = nullptr;
-
-        if (includeCapability)
-        {
-            capability.Sid = capabilitySid;
-            capability.Attributes = SE_GROUP_ENABLED;
-
-            capabilityCount = 1;
-            capabilityArray = &capability;
-        }
-
-        SetLastError(ERROR_SUCCESS);
-
-        if (!AuthzSetAppContainerInformation(
-                ownedContext.get(),
-                packageSid,
-                capabilityCount,
-                capabilityArray))
-        {
-            const DWORD error = GetLastError();
-
-            std::wcerr
-                << L"AuthzSetAppContainerInformation failed for:\n"
-                << L"  package SID: ";
-
-            LPWSTR packageString = nullptr;
-
-            if (ConvertSidToStringSidW(
-                    packageSid,
-                    &packageString))
-            {
-                std::wcerr << packageString;
-                LocalFree(packageString);
-            }
-            else
-            {
-                std::wcerr << L"<conversion failed>";
-            }
-
-            std::wcerr
-                << L"\n  capability included: "
-                << (includeCapability ? L"yes" : L"no")
-                << L"\n";
-
-            Fail(
-                L"AuthzSetAppContainerInformation",
-                error);
-        }
-
-        return ownedContext;
-    }
-
-    struct CheckResult
-    {
-        bool apiSucceeded = false;
-        ACCESS_MASK grantedAccess = 0;
-        DWORD error = ERROR_SUCCESS;
-    };
-
-    CheckResult CheckAccess(
-        AUTHZ_CLIENT_CONTEXT_HANDLE context,
-        PSECURITY_DESCRIPTOR securityDescriptor)
-    {
-        AUTHZ_ACCESS_REQUEST request{};
-        request.DesiredAccess = kTestAccess;
-        request.PrincipalSelfSid = nullptr;
-        request.ObjectTypeList = nullptr;
-        request.ObjectTypeListLength = 0;
-        request.OptionalArguments = nullptr;
-
-        ACCESS_MASK grantedAccess = 0;
-        DWORD resultError = ERROR_SUCCESS;
-
-        AUTHZ_ACCESS_REPLY reply{};
-        reply.ResultListLength = 1;
-        reply.GrantedAccessMask = &grantedAccess;
-        reply.SaclEvaluationResults = nullptr;
-        reply.Error = &resultError;
-
-        SetLastError(ERROR_SUCCESS);
-
-        const BOOL succeeded = AuthzAccessCheck(
-            0,
-            context,
-            &request,
+    auto* buffer = static_cast<char*>(
+        VirtualAlloc(
             nullptr,
-            securityDescriptor,
-            nullptr,
-            0,
-            &reply,
-            nullptr);
+            BufferSize,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE));
 
-        if (!succeeded)
-        {
-            return {
-                false,
-                0,
-                GetLastError()
-            };
-        }
+    if (!buffer)
+    {
+        std::cerr
+            << "VirtualAlloc failed. GetLastError="
+            << GetLastError()
+            << '\n';
 
-        return {
-            true,
-            grantedAccess,
-            resultError
-        };
+        return 1;
     }
 
-    std::wstring FormatResult(const CheckResult& result)
-    {
-        wchar_t buffer[128]{};
+    strcpy_s(buffer, BufferSize, "BEFORE");
 
-        if (!result.apiSucceeded)
-        {
-            swprintf_s(
-                buffer,
-                L"API-FAIL/error=%lu",
-                static_cast<unsigned long>(result.error));
-        }
-        else
-        {
-            swprintf_s(
-                buffer,
-                L"0x%08lX/error=%lu",
-                static_cast<unsigned long>(
-                    result.grantedAccess),
-                static_cast<unsigned long>(
-                    result.error));
-        }
+    std::cout
+        << "PID:     "
+        << GetCurrentProcessId()
+        << '\n';
 
-        return buffer;
-    }
+    std::cout
+        << "Address: 0x"
+        << std::hex
+        << reinterpret_cast<std::uintptr_t>(buffer)
+        << std::dec
+        << '\n';
 
-    struct ContextRow
-    {
-        const wchar_t* name;
-        AUTHZ_CLIENT_CONTEXT_HANDLE context;
-    };
-}
+    std::cout
+        << "Value:   "
+        << buffer
+        << "\n\n";
 
-int wmain()
-{
-    AuthzResourceManager resourceManager;
+    std::cout
+        << "Leave this process running.\n"
+        << "Run the writer in another terminal, "
+        << "then press Enter here."
+        << std::endl;
 
-    auto baseUserSid =
-        SidFromString(kBaseUserSid);
+    std::cin.get();
 
-    auto packageSid1 =
-        SidFromString(kPackageSid1);
+    std::cout
+        << "\nValue after WriteProcessMemory: "
+        << buffer
+        << '\n';
 
-    auto packageSid2 =
-        SidFromString(kPackageSid2);
-
-    auto capabilitySid =
-        SidFromString(kCapabilitySid);
-
-    auto packageAceSecurityDescriptor =
-        SecurityDescriptorForSid(kPackageSid1);
-
-    auto capabilityAceSecurityDescriptor =
-        SecurityDescriptorForSid(kCapabilitySid);
-
-    // 1. Package 1 without the capability.
-    auto package1WithoutCapability =
-        MakeAppContainerContext(
-            resourceManager.get(),
-            static_cast<PSID>(baseUserSid.get()),
-            static_cast<PSID>(packageSid1.get()),
-            static_cast<PSID>(capabilitySid.get()),
-            false);
-
-    // 2. Package 1 with the capability.
-    auto package1WithCapability =
-        MakeAppContainerContext(
-            resourceManager.get(),
-            static_cast<PSID>(baseUserSid.get()),
-            static_cast<PSID>(packageSid1.get()),
-            static_cast<PSID>(capabilitySid.get()),
-            true);
-
-    // 3. Package 2 without the capability.
-    auto package2WithoutCapability =
-        MakeAppContainerContext(
-            resourceManager.get(),
-            static_cast<PSID>(baseUserSid.get()),
-            static_cast<PSID>(packageSid2.get()),
-            static_cast<PSID>(capabilitySid.get()),
-            false);
-
-    // 4. Package 2 with the same capability.
-    auto package2WithCapability =
-        MakeAppContainerContext(
-            resourceManager.get(),
-            static_cast<PSID>(baseUserSid.get()),
-            static_cast<PSID>(packageSid2.get()),
-            static_cast<PSID>(capabilitySid.get()),
-            true);
-
-    const std::vector<ContextRow> rows{
-        {
-            L"package 1, no capability",
-            package1WithoutCapability.get()
-        },
-        {
-            L"package 1 + capability",
-            package1WithCapability.get()
-        },
-        {
-            L"package 2, no capability",
-            package2WithoutCapability.get()
-        },
-        {
-            L"package 2 + capability",
-            package2WithCapability.get()
-        }
-    };
-
-    std::wcout
-        << L"Base user SID : " << kBaseUserSid << L"\n"
-        << L"Package SID 1 : " << kPackageSid1 << L"\n"
-        << L"Package SID 2 : " << kPackageSid2 << L"\n"
-        << L"Capability SID: " << kCapabilitySid << L"\n"
-        << L"Desired access: 0x00000001\n"
-        << L"Contexts configured with: "
-           L"AuthzSetAppContainerInformation\n\n";
-
-    std::wcout
-        << std::left
-        << std::setw(34) << L"context"
-        << std::setw(30) << L"package-1 ACE SD"
-        << L"capability ACE SD\n";
-
-    std::wcout
-        << std::wstring(94, L'-')
-        << L"\n";
-
-    for (const ContextRow& row : rows)
-    {
-        const CheckResult packageResult =
-            CheckAccess(
-                row.context,
-                static_cast<PSECURITY_DESCRIPTOR>(
-                    packageAceSecurityDescriptor.get()));
-
-        const CheckResult capabilityResult =
-            CheckAccess(
-                row.context,
-                static_cast<PSECURITY_DESCRIPTOR>(
-                    capabilityAceSecurityDescriptor.get()));
-
-        std::wcout
-            << std::left
-            << std::setw(34) << row.name
-            << std::setw(30) << FormatResult(packageResult)
-            << FormatResult(capabilityResult)
-            << L"\n";
-    }
-
+    VirtualFree(buffer, 0, MEM_RELEASE);
     return 0;
 }
 
-cmake_minimum_required(VERSION 3.20)
+static int RunWriter(int argc, wchar_t* argv[])
+{
+    if (argc != 4)
+    {
+        std::wcerr
+            << L"Usage:\n"
+            << L"  wpm_repro.exe write <PID> <hex-address>\n";
 
-project(authz_package_capability_repro LANGUAGES CXX)
+        return 1;
+    }
 
-add_executable(
-    authz_package_capability_repro
-    main.cpp
-)
+    wchar_t* pidEnd = nullptr;
 
-target_compile_features(
-    authz_package_capability_repro
-    PRIVATE cxx_std_17
-)
+    const unsigned long parsedPid =
+        std::wcstoul(argv[2], &pidEnd, 10);
 
-target_compile_definitions(
-    authz_package_capability_repro
-    PRIVATE
-        UNICODE
-        _UNICODE
-)
+    if (!pidEnd || *pidEnd != L'\0' || parsedPid == 0)
+    {
+        std::wcerr
+            << L"Invalid PID: "
+            << argv[2]
+            << L'\n';
 
-target_link_libraries(
-    authz_package_capability_repro
-    PRIVATE
-        Authz
-        Advapi32
-)
+        return 1;
+    }
 
-PS C:\Users\nguyen\reproAC\build\Debug> ."C:/Users/nguyen/reproAC/build/Debug/authz_package_capability_repro.exe"
-Base user SID : S-1-5-21-1-2-3-1000
-Package SID 1 : S-1-15-2-100-101-102-103-104-105-106-107
-Package SID 2 : S-1-15-2-200-201-202-203-204-205-206-207
-Capability SID: S-1-15-3-1
-Desired access: 0x00000001
-Contexts configured with: AuthzSetAppContainerInformation
+    wchar_t* addressEnd = nullptr;
 
-context                           package-1 ACE SD              capability ACE SD
-----------------------------------------------------------------------------------------------
-package 1, no capability          0x00000000/error=5            0x00000000/error=5
-package 1 + capability            0x00000000/error=5            0x00000000/error=5
-package 2, no capability          0x00000000/error=5            0x00000000/error=5
-package 2 + capability            0x00000000/error=5            0x00000000/error=5
-PS C:\Users\nguyen\reproAC\build\Debug> ."C:/Users/nguyen/reproAC/build/Debug/authz_package_capability_repro.exe"
-Base user SID : S-1-5-21-1-2-3-1000
-Package SID 1 : S-1-15-2-100-101-102-103-104-105-106-107
-Package SID 2 : S-1-15-2-200-201-202-203-204-205-206-207
-Capability SID: S-1-15-3-1
-Desired access: 0x00000001
-Contexts configured with: AuthzSetAppContainerInformation
+    const unsigned long long parsedAddress =
+        std::wcstoull(argv[3], &addressEnd, 0);
 
-context                           package-1 ACE SD              capability ACE SD
-----------------------------------------------------------------------------------------------
-package 1, no capability          0x00000001/error=0            0x00000000/error=5
-package 1 + capability            0x00000001/error=0            0x00000001/error=0
-package 2, no capability          0x00000000/error=5            0x00000000/error=5
-package 2 + capability            0x00000000/error=5            0x00000001/error=0
-PS C:\Users\nguyen\reproAC\build\Debug> 
+    if (!addressEnd ||
+        *addressEnd != L'\0' ||
+        parsedAddress == 0)
+    {
+        std::wcerr
+            << L"Invalid address: "
+            << argv[3]
+            << L'\n';
+
+        return 1;
+    }
+
+    const DWORD pid =
+        static_cast<DWORD>(parsedPid);
+
+    void* remoteAddress =
+        reinterpret_cast<void*>(
+            static_cast<std::uintptr_t>(parsedAddress));
+
+    /*
+        This reproduces the access mask from the claim.
+
+        Deliberately absent:
+            PROCESS_VM_OPERATION
+    */
+    constexpr DWORD RequestedAccess =
+        PROCESS_VM_WRITE |
+        PROCESS_VM_READ |
+        PROCESS_QUERY_LIMITED_INFORMATION;
+
+    static_assert(
+        (RequestedAccess & PROCESS_VM_OPERATION) == 0,
+        "PROCESS_VM_OPERATION must not be requested");
+
+    std::cout
+        << "PROCESS_VM_WRITE                  = 0x"
+        << std::hex
+        << PROCESS_VM_WRITE
+        << '\n';
+
+    std::cout
+        << "PROCESS_VM_OPERATION              = 0x"
+        << PROCESS_VM_OPERATION
+        << '\n';
+
+    std::cout
+        << "PROCESS_VM_READ                   = 0x"
+        << PROCESS_VM_READ
+        << '\n';
+
+    std::cout
+        << "PROCESS_QUERY_LIMITED_INFORMATION = 0x"
+        << PROCESS_QUERY_LIMITED_INFORMATION
+        << '\n';
+
+    std::cout
+        << "Requested access mask             = 0x"
+        << RequestedAccess
+        << std::dec
+        << "\n\n";
+
+    HANDLE process = OpenProcess(
+        RequestedAccess,
+        FALSE,
+        pid);
+
+    if (!process)
+    {
+        std::cerr
+            << "OpenProcess failed. GetLastError="
+            << GetLastError()
+            << '\n';
+
+        return 1;
+    }
+
+    const char replacement[] =
+        "AFTER: write succeeded without VM_OPERATION";
+
+    SIZE_T bytesWritten = 0;
+
+    SetLastError(ERROR_SUCCESS);
+
+    const BOOL result = WriteProcessMemory(
+        process,
+        remoteAddress,
+        replacement,
+        sizeof(replacement),
+        &bytesWritten);
+
+    const DWORD error =
+        result ? ERROR_SUCCESS : GetLastError();
+
+    std::cout
+        << "WriteProcessMemory returned: "
+        << (result ? "TRUE" : "FALSE")
+        << '\n';
+
+    std::cout
+        << "Bytes written: "
+        << bytesWritten
+        << '\n';
+
+    std::cout
+        << "Error: "
+        << error
+        << '\n';
+
+    CloseHandle(process);
+
+    return result ? 0 : 1;
+}
+
+int wmain(int argc, wchar_t* argv[])
+{
+    if (argc == 2 &&
+        std::wcscmp(argv[1], L"target") == 0)
+    {
+        return RunTarget();
+    }
+
+    if (argc >= 2 &&
+        std::wcscmp(argv[1], L"write") == 0)
+    {
+        return RunWriter(argc, argv);
+    }
+
+    std::wcerr
+        << L"Usage:\n"
+        << L"  wpm_repro.exe target\n"
+        << L"  wpm_repro.exe write <PID> <hex-address>\n";
+
+    return 1;
+}
