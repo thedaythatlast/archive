@@ -1,6 +1,6 @@
 Hi @RLWA32,
 
-Thanks for asking. I checked the results from my additional tests, and I was able to reproduce the behavior you described for all three VirtualAlloc protection settings in a same-process scenario.
+Thanks for asking. In my same-process tests, I was able to reproduce the write results you described for all three VirtualAlloc protection settings.
 
 I allocated three regions using VirtualAlloc, initially with PAGE_READWRITE, and then changed two of them to PAGE_READONLY and PAGE_EXECUTE_READ using VirtualProtect.
 
@@ -18,8 +18,6 @@ PAGE_READONLY                  ok=0  written=0  error=998  value=0x22
 PAGE_EXECUTE_READ              ok=1  written=1  error=0  value=0xC1
 ```
 
-This matches your observations, including the ERROR_NOACCESS result when writing to PAGE_READONLY memory and the successful write to PAGE_EXECUTE_READ memory when PROCESS_VM_OPERATION is included.
+With PROCESS_VM_WRITE only, all three writes failed with ERROR_ACCESS_DENIED. When PROCESS_VM_OPERATION was also included, writes to PAGE_READWRITE and PAGE_EXECUTE_READ succeeded, while the write to PAGE_READONLY failed with ERROR_NOACCESS.
 
-My original cross-process reproduction was limited to a PAGE_READWRITE region allocated with VirtualAlloc, where WriteProcessMemory succeeded without PROCESS_VM_OPERATION. I haven't yet extended the tests to cover HeapAlloc, GlobalAlloc, LocalAlloc, or variables in separate memory sections. I also haven't repeated the three protection tests across separate processes.
-
-So far, the results confirm your observations for the three VirtualAlloc protection settings in the same-process scenario, while the behavior you initially reported for the cross-process case remains something I haven't fully investigated.
+My original cross-process reproduction was limited to a PAGE_READWRITE region allocated with VirtualAlloc, where WriteProcessMemory succeeded without PROCESS_VM_OPERATION. I haven't yet tested memory allocated using HeapAlloc, GlobalAlloc, or LocalAlloc, or variables in their own segments. I also haven't repeated all three protection tests across separate processes. These tests cover WriteProcessMemory only.
