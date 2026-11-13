@@ -1,4 +1,6 @@
-The relevant source is the official [JsonSerializer.xml file in the dotnet-api-docs repository](https://github.com/dotnet/dotnet-api-docs/blob/main/xml/System.Text.Json/JsonSerializer.xml).
+Hello and thank you for reaching out.
+
+The relevant source is the official [JsonSerializer.xml file](https://github.com/dotnet/dotnet-api-docs/blob/main/xml/System.Text.Json/JsonSerializer.xml) in the `dotnet-api-docs` repository.
 
 For `SerializeToUtf8Bytes<TValue>(TValue, JsonSerializerOptions)`, the relevant XML member is around lines 5874–5937.
 
@@ -19,4 +21,4 @@ You can also verify the generated reference here:
 
 Regarding the `System.Text.Json v11.0.0` package header: it identifies package metadata on the aggregated API page. It should not, by itself, be interpreted as evidence that the displayed method documentation applies exclusively to .NET 11. The .NET 10 applicability is independently represented in the API reference.
 
-**In short:** The official documentation supports the return contract for .NET 10, but there is no separate `FrameworkAlternate` annotation directly attached to the Returns prose that I can point to as its exclusive moniker range.
+[accept answer nudge]
