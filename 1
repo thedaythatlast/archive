@@ -1,6 +1,4 @@
-Hello,
-
-Thank you for your question!
+[hello thank you for your question craps]
 
 When formatting the date, you can use the null-conditional operator (`?.`) to call `ToShortDateString()` only when `Birth` has a value:
 
@@ -10,13 +8,11 @@ var dob = Birth?.ToShortDateString();
 
 Just make sure that `Birth` is declared as a nullable `DateTime` (`DateTime?`) in your model as well.
 
-Also, depending on what you want to do with `dob`, you could consider using the null-coalescing operator (`??`) to provide a fallback value:
+Also, depending on what you want to do with `dob`, you could consider using the null-coalescing operator (`??`) to provide a fallback value, or use an explicit `HasValue` check:
 
 ```csharp
 var dob = Birth?.ToShortDateString() ?? "";
 ```
-
-Alternatively, you can use an explicit `HasValue` check:
 
 ```csharp
 var dob = Birth.HasValue
@@ -24,4 +20,6 @@ var dob = Birth.HasValue
     : "";
 ```
 
-I hope this helps!
+
+I hope this helps, and please let me know if you have other questions.
+[accept answer sentence]
