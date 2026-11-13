@@ -15,7 +15,9 @@ Also, depending on what you need, you can use `??` to provide a fallback value:
 ```csharp
 var dob = Birth?.ToShortDateString() ?? "";
 ```
+```csharp
+var dob = Birth.HasValue
+    ? Birth.Value.ToShortDateString()
+    : "";
+```
 
-Or use an explicit `HasValue` check.
-
-Hope this helps!
